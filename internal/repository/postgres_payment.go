@@ -35,4 +35,33 @@ func (r *PostgresPaymentRepository) FindByOrderID(ctx context.Context, orderID s
 		return nil, domain.ErrNotFound
 	}
 	return p, err
+
+}
+func (r *PostgresPaymentRepository) FindByAmountRange(ctx context.Context, min, max int64) ([]*domain.Payment, error) {
+	query := `
+		SELECT id, order_id, transaction_id, amount, status 
+		FROM payments 
+		WHERE (amount >= $1 OR $1 = 0) 
+		  AND (amount <= $2 OR $2 = 0)
+	`
+	rows, err := r.db.QueryContext(ctx, query, min, max)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var payments []*domain.Payment
+	for rows.Next() {
+		p := &domain.Payment{}
+		if err := rows.Scan(&p.ID, &p.OrderID, &p.TransactionID, &p.Amount, &p.Status); err != nil {
+			return nil, err
+		}
+		payments = append(payments, p)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	return payments, nil
 }

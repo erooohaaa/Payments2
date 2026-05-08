@@ -1,80 +1,263 @@
-# 🛒 Order & Payment Microservices
+# Содержимое файла (для справки):
+"""
+AP2 Assignment 3 — Event-Driven Architecture with RabbitMQ
 
-> Educational project in Go --- two microservices using Clean
-> Architecture, REST API, and PostgreSQL.
+=== Project Structure ===
+.
+├── docker-compose.yml
+├── Orders/
+│   ├── Dockerfile
+│   ├── go.mod
+│   ├── cmd/order-service/main.go
+│   └── internal/
+│       ├── app/app.go
+│       ├── domain/order.go
+│       ├── repository/
+│       ├── transport/grpc/
+│       ├── transport/http/
+│       └── usecase/
+├── Payments/
+│   ├── Dockerfile
+│   ├── go.mod
+│   ├── cmd/payment-service/main.go
+│   └── internal/
+│       ├── domain/payment.go
+│       ├── messaging/
+│       │   ├── publisher.go
+│       │   └── rabbitmq_publisher.go
+│       ├── repository/
+│       ├── transport/grpc/
+│       └── usecase/payment_usecase.go
+├── Notification/
+│   ├── Dockerfile
+│   ├── go.mod
+│   ├── cmd/notification-service/main.go
+│   └── internal/
+│       ├── domain/event.go
+│       ├── messaging/rabbitmq_consumer.go
+│       └── usecase/notification_usecase.go
+├── orders-proto/
+└── orders-generated/
 
-------------------------------------------------------------------------
+=== Architecture ===
+Client
+│
+│  POST /orders  (HTTP REST)
+▼
+Order Service (:8080)
+│
+│  gRPC ProcessPayment
+▼
+Payment Service (:50051)
+│
+│  JSON Event -> PublishPaymentCompleted
+▼
+RabbitMQ queue: "payment.completed"  (durable, persistent)
+│
+│  Manual ACK Consumer
+▼
+Notification Service
+│  [Notification] Sent email to X for Order #Y. Amount: $Z
+│
+│  on error > 3 retries
+▼
+Dead Letter Queue: "payment.completed.dlq"
 
-## 📌 What is this?
+=== Components ===
 
-I built two small services that work together:
+1. Order Service
+- Accepts HTTP requests from the client.
+- Creates an order in PostgreSQL.
+- Calls Payment Service via gRPC for payment authorization.
+- Port: 8080
 
--   **Order Service** --- receives customer orders\
--   **Payment Service** --- processes payments
+2. Payment Service
+- gRPC server, accepts requests from Order Service.
+- Saves payment record in PostgreSQL.
+- Publishes an event to RabbitMQ after successful storage.
+- Port: 50051
 
-When a new order is created, the Order Service calls the Payment Service
-and asks: "Can we charge this amount?". If yes --- the order becomes
-**Paid**. If not --- it is marked as **Failed**.
+3. Notification Service
+- Listens to the "payment.completed" queue in RabbitMQ.
+- Logs an email sending simulation upon receiving an event.
+- Implements idempotency via an in-memory map.
+- Uses manual ACK.
 
-Each service is a **separate application** with its **own database**.
+4. RabbitMQ
+- Message broker between Payment and Notification services.
+- "payment.completed" queue is durable.
+- "payment.completed.dlq" serves as the Dead Letter Queue.
+- Web UI is available on port 15672.
 
-------------------------------------------------------------------------
+5. PostgreSQL
+- Single DB for both services (using separate tables).
+- "orders" table for Order Service.
+- "payments" table for Payment Service.
 
-## 🔍 How it works
+=== Execution Guide ===
 
-User → Order Service → Payment Service → Order updated → Response to
-user
+Requirements:
+- Docker
+- Docker Compose
+  (Go, RabbitMQ, and PostgreSQL are handled within containers).
 
-------------------------------------------------------------------------
+Step 1 — Download dependencies (Once)
+Enter Payments folder:
+cd Payments && go mod tidy && cd ..
 
-## 🏗️ Architecture
+Enter Notification folder:
+cd Notification && go mod tidy && cd ..
 
-Clean Architecture means: - Business logic is independent - Database is
-separate - HTTP layer is separate
+Step 2 — Launch
+docker-compose up --build
+(Initial startup takes 2-3 minutes to download images and compile services).
 
-Layers: - domain --- models - usecase --- logic - repository ---
-database - transport/http --- handlers
+Step 3 — Verify
+Open a second terminal and run:
+curl -X POST http://localhost:8080/orders \
+-H "Content-Type: application/json" \
+-d '{"customer_id":"user-1","item_name":"Book","amount":4999}'
 
-Each service has its own DB.
+Expected logs:
+payment-service      | [Payment] Event published -> queue=payment.completed order_id=... status=Authorized
+notification-service | [Notification] Sent email to customer-xxxx@example.com for Order #xxxx. Amount: $49.99
 
-------------------------------------------------------------------------
+Step 4 — Stop
+docker-compose down
+To stop and wipe all data (DB, queues):
+docker-compose down -v
 
-## 🚀 How to Run
+=== Useful Commands ===
+View logs for a specific service:
+docker-compose logs -f notification-service
 
-``` bash
-git clone https://github.com/your-username/your-repo.git
-cd your-repo
-```
+Rebuild a single service:
+docker-compose up --build notification-service
 
-Create DB:
+Check container status:
+docker-compose ps
 
-``` sql
-CREATE DATABASE order_db;
-CREATE DATABASE payment_db;
-```
+=== RabbitMQ Web UI ===
+URL: http://localhost:15672
+Login: guest / Password: guest
+Monitor: queues, message count, throughput, or publish test messages manually.
 
-Run services:
+=== API Reference ===
+1. Create Order
+   POST http://localhost:8080/orders
+   Body: {"customer_id": "user-1", "item_name": "Book", "amount": 4999}
 
-``` bash
-cd Payments && go run ./cmd/payment-service/main.go
-cd Orders && go run ./cmd/order-service/main.go
-```
-Postman
-``` sql
-http://localhost:8080/orders
+2. Get Order
+   GET http://localhost:8080/orders/{id}
+
+3. Cancel Order
+   PATCH http://localhost:8080/orders/{id}/cancel
+
+=== Idempotency Strategy ===
+Each event contains a unique message_id (UUID generated by Payment Service).
+Notification Service uses map[string]struct{} with sync.Mutex:
+1. Receive message -> Parse JSON.
+2. If message_id exists in processedIDs: d.Ack() and exit.
+3. If new: Process, add to map, d.Ack().
+   Note: Map resets on service restart (use Redis for production).
+
+=== ACK Logic ===
+1. Receive message (autoAck = false).
+2. Parse JSON.
+    - If error: d.Nack(requeue=false) -> Move to DLQ.
+3. uc.Handle(event).
+    - If error and retry < 3: d.Nack(requeue=true) -> Retry.
+    - If error and retry >= 3: d.Nack(requeue=false) -> Move to DLQ.
+4. Success or Duplicate: d.Ack().
+
+=== Reliability Table ===
+Feature | Implementation
+--- | ---
+Durable queues | durable: true in QueueDeclare
+Persistent messages | DeliveryMode: amqp.Persistent
+Manual ACK | autoAck=false, explicit d.Ack()
+At-least-once delivery | Re-deliver on failure before ACK
+Idempotency | message_id UUID + in-memory map
+Graceful Shutdown | os/signal + context.Cancel / server.GracefulStop()
+Dead Letter Queue | x-dead-letter-routing-key after 3 retries
+
+=== DLQ Demonstration (Bonus) ===
+1. Open RabbitMQ UI -> Queues -> payment.completed.
+2. Use "Publish message".
+3. Enter invalid JSON: {bad json}.
+4. Click Publish.
+5. Notification logs will show: [Notification] Poison message — bad JSON... -> DLQ.
+6. Message moves to payment.completed.dlq.
+   """
+
+
+Шаг 1. Показываем, что всё работает (Happy Path)
+Что делать:
+
+В Postman выбери POST, адрес http://localhost:8080/orders.
+
+Во вкладке Body -> raw -> JSON вставь это:
+
+JSON
 {
-  "customer_id": "cust_1",
-  "item_name": "iPhone",
-  "amount": 50000
+"id": "ORDER-101",
+"customer_id": "STUDENT-01",
+"item_name": "Laptop",
+"amount": 50000
 }
-http://localhost:8080/orders/{id}/cancel
-POST http://localhost:8081/payments
-```
-------------------------------------------------------------------------
+Нажми Send.
 
-## 🎓 What I learned
+Что сказать:
 
--   Clean Architecture basics
--   Microservices communication via REST
--   Working with PostgreSQL in Go
--   Handling failures and timeouts
+«Смотрите, я создаю заказ через API. Запрос ушел в Order Service, тот сохранил его в базу и через gRPC пнул Payment Service. Тот провел оплату и кинул сообщение в RabbitMQ. А вот тут в логах видно, что Notification Service поймал сообщение и 'отправил' письмо».
+
+Покажи пальцем на строчку в логах: [Notification] Sent email....
+
+Шаг 2. Показываем «мозги» системы (RabbitMQ)
+Что делать:
+
+Переключись в браузер на страницу RabbitMQ.
+
+Нажми сверху на вкладку Queues.
+
+Что сказать:
+
+«Это панель управления RabbitMQ. Вот наша очередь payment.completed. Сервисы общаются не напрямую, а через этого посредника. Это делает систему надежной».
+
+Шаг 3. Показываем надежность (Если всё сломалось)
+Что делать:
+
+В GoLand открой второй терминал (нажми на +) и напиши:
+docker compose stop notification-service
+
+Вернись в Postman и еще раз нажми Send (с тем же JSON).
+
+Вернись в браузер в RabbitMQ и покажи на цифру в столбце Ready.
+
+Что сказать:
+
+«Я выключил сервис уведомлений. Но сообщение не пропало! Видите, оно висит в RabbitMQ и ждет. Как только я включу сервис обратно (введи в терминале docker compose start notification-service), он сразу дочитает то, что пропустил».
+
+Шаг 4. Защита от дублей (Идемпотентность)
+Что делать:
+
+В браузере в RabbitMQ нажми на имя очереди payment.completed.
+
+Прокрути вниз до Publish message.
+
+В поле Payload вставь тот же JSON из Шага 1.
+
+Нажми кнопку Publish message 3 раза подряд.
+
+Что сказать:
+
+«Я специально отправил одно и то же сообщение три раза вручную. Но если мы посмотрим в логи, Notification Service вывел надпись только один раз. Это работает идемпотентность: сервис запоминает ID заказа и не шлет письмо повторно, если видит дубликат».
+
+Шаг 5. Красивый уход (Graceful Shutdown)
+Что делать:
+
+Вернись в терминал с логами и нажми Ctrl + C.
+
+Что сказать:
+
+«И последнее: сервисы выключаются правильно. Видите, они пишут в логах 'Shutting down', закрывают соединения с базой Postgres и RabbitMQ. Мы не обрываем связи грубо, а завершаем работу аккуратно».
